@@ -8,3 +8,6 @@
 
 # Built Visual Studio Code Extensions
 *.vsix
+
+#downloads test folder
+downloads/*

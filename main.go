@@ -18,18 +18,21 @@ import (
 func main() {
 	// Parse command line arguments
 	var (
-		botToken   = flag.String("token", "", "Telegram bot token")
-		folder     = flag.String("folder", "./downloads", "Download folder path")
-		allowedUID = flag.String("user", "", "Allowed user ID (required)")
+		botToken   = flag.String("token", os.Getenv("TELEGRAM_BOT_TOKEN"), "Telegram bot token")
+		folder     = flag.String("folder", os.Getenv("TELEGRAM_FOLDER"), "Download folder path")
+		allowedUID = flag.String("user", os.Getenv("TELEGRAM_USER_ID"), "Allowed user ID (required)")
 	)
 	flag.Parse()
 
 	// Validate required parameters
 	if *botToken == "" {
-		log.Fatal("Bot token is required. Use -token flag")
+		log.Fatal("Bot token is required. Use -token flag or environment variable TELEGRAM_BOT_TOKEN")
+	}
+	if *folder == "" {
+		log.Fatal("Download folder path is required. Use -folder flag or environment variable TELEGRAM_FOLDER")
 	}
 	if *allowedUID == "" {
-		log.Fatal("Allowed user ID is required. Use -user flag")
+		log.Fatal("Allowed user ID is required. Use -user flag or environment variable TELEGRAM_USER_ID")
 	}
 
 	// Create download folder if it doesn't exist
@@ -87,16 +90,6 @@ func main() {
 		if message.From.ID != allowedUserID {
 			log.Printf("Ignoring message from unauthorized user: %s (ID: %d)",
 				message.From.UserName, message.From.ID)
-			continue
-		}
-
-		// Handle /start command
-		if message.IsCommand() && message.Command() == "start" {
-			timestamp := time.Now().Format("2006-01-02 15:04:05")
-			msg := tgbotapi.NewMessage(message.Chat.ID, fmt.Sprintf("[%s] Hi, show me the docs!", timestamp))
-			if _, err := bot.Send(msg); err != nil {
-				log.Printf("Error sending start message: %v", err)
-			}
 			continue
 		}
 
