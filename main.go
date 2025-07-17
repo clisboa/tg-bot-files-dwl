@@ -21,6 +21,7 @@ func main() {
 		botToken   = flag.String("token", os.Getenv("TELEGRAM_BOT_TOKEN"), "Telegram bot token")
 		folder     = flag.String("folder", os.Getenv("TELEGRAM_FOLDER"), "Download folder path")
 		allowedUID = flag.String("user", os.Getenv("TELEGRAM_USER_ID"), "Allowed user ID (required)")
+		debug      = flag.String("debug", os.Getenv("TELEGRAM_DEBUG"), "Debug mode? (optional - true or false/leave empty for off)")
 	)
 	flag.Parse()
 
@@ -34,6 +35,12 @@ func main() {
 	if *allowedUID == "" {
 		log.Fatal("Allowed user ID is required. Use -user flag or environment variable TELEGRAM_USER_ID")
 	}
+	if *debug == "" {
+		log.Printf("Debug mode off")
+		*debug = "false"
+	} else {
+		log.Printf("Debug mode on")
+	}
 
 	// Create download folder if it doesn't exist
 	if err := os.MkdirAll(*folder, 0755); err != nil {
@@ -46,7 +53,7 @@ func main() {
 		log.Fatalf("Failed to initialize bot: %v", err)
 	}
 
-	bot.Debug = true
+	bot.Debug, _ = strconv.ParseBool(*debug)
 	log.Printf("Authorized on account %s", bot.Self.UserName)
 	log.Printf("Monitoring direct chats for documents")
 	log.Printf("Download folder: %s", *folder)
