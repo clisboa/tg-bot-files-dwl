@@ -15,13 +15,19 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
+const (
+	// Telegram Bot API file size limit
+	TelegramMaxFileSize = 20 * 1024 * 1024 // 20MB in bytes
+)
+
 func main() {
 	// Parse command line arguments
 	var (
-		botToken   = flag.String("token", os.Getenv("TELEGRAM_BOT_TOKEN"), "Telegram bot token")
-		folder     = flag.String("folder", os.Getenv("TELEGRAM_FOLDER"), "Download folder path")
-		allowedUID = flag.String("user", os.Getenv("TELEGRAM_USER_ID"), "Allowed user ID (required)")
-		debug      = flag.String("debug", os.Getenv("TELEGRAM_DEBUG"), "Debug mode? (optional - true or false/leave empty for off)")
+		botToken     = flag.String("token", os.Getenv("TELEGRAM_BOT_TOKEN"), "Telegram bot token")
+		folder       = flag.String("folder", os.Getenv("TELEGRAM_FOLDER"), "Download folder path")
+		allowedUID   = flag.String("user", os.Getenv("TELEGRAM_USER_ID"), "Allowed user ID (required)")
+		debug        = flag.String("debug", os.Getenv("TELEGRAM_DEBUG"), "Debug mode? (optional - true or false/leave empty for off)")
+		allowedTypes = flag.String("types", os.Getenv("TELEGRAM_ALLOWED_TYPES"), "Comma-separated list of allowed file extensions (e.g., pdf,txt,docx). Leave empty to allow all types")
 	)
 	flag.Parse()
 
@@ -40,6 +46,23 @@ func main() {
 		*debug = "false"
 	} else {
 		log.Printf("Debug mode on")
+	}
+
+	// Parse and validate allowed file types
+	var allowedExtensions []string
+	if *allowedTypes != "" {
+		extensions := strings.Split(*allowedTypes, ",")
+		for _, ext := range extensions {
+			ext = strings.TrimSpace(ext)
+			if ext != "" {
+				// Normalize extension (remove leading dot, convert to lowercase)
+				ext = strings.TrimPrefix(ext, ".")
+				allowedExtensions = append(allowedExtensions, strings.ToLower(ext))
+			}
+		}
+		log.Printf("Allowed file types: %v", allowedExtensions)
+	} else {
+		log.Printf("All file types allowed")
 	}
 
 	// Create download folder if it doesn't exist
@@ -67,7 +90,17 @@ func main() {
 
 	// Send initial greeting message to the allowed user
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
-	initialMsg := tgbotapi.NewMessage(allowedUserID, fmt.Sprintf("[%s] Hi, show me the docs!", timestamp))
+	greetingMsg := fmt.Sprintf("[%s] Hi, show me the docs!\n\n📋 File size limit: %s", timestamp, formatBytes(TelegramMaxFileSize))
+
+	if len(allowedExtensions) > 0 {
+		greetingMsg += fmt.Sprintf("\n📎 Allowed types: %s", strings.Join(allowedExtensions, ", "))
+	} else {
+		greetingMsg += "\n📎 All file types accepted"
+	}
+
+	greetingMsg += "\n💡 For larger files, consider using cloud storage services."
+
+	initialMsg := tgbotapi.NewMessage(allowedUserID, greetingMsg)
 	if _, err := bot.Send(initialMsg); err != nil {
 		log.Printf("Error sending initial message: %v", err)
 	} else {
@@ -101,14 +134,14 @@ func main() {
 		}
 
 		// Handle document messages only
-		if err := handleDocumentMessage(bot, message, *folder); err != nil {
+		if err := handleDocumentMessage(bot, message, *folder, allowedExtensions); err != nil {
 			log.Printf("Error handling document: %v", err)
 		}
 	}
 }
 
 // handleDocumentMessage processes messages that contain documents only
-func handleDocumentMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, downloadFolder string) error {
+func handleDocumentMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, downloadFolder string, allowedExtensions []string) error {
 	// Only handle document messages
 	if message.Document == nil {
 		return nil
@@ -121,8 +154,45 @@ func handleDocumentMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, down
 	log.Printf("Found document from user %s: %s (size: %d bytes)",
 		message.From.UserName, fileName, fileSize)
 
+	// Check file type if restrictions are enabled
+	if len(allowedExtensions) > 0 {
+		if !isAllowedFileType(fileName, allowedExtensions) {
+			fileExt := strings.ToLower(filepath.Ext(fileName))
+			if fileExt != "" && strings.HasPrefix(fileExt, ".") {
+				fileExt = fileExt[1:] // Remove the dot
+			}
+
+			errorMsg := fmt.Sprintf("❌ File type not allowed: %s\n📎 Extension: %s\n✅ Allowed types: %s\n\n💡 Please convert your file to an allowed format or contact the administrator to add this file type.",
+				fileName,
+				fileExt,
+				strings.Join(allowedExtensions, ", "))
+
+			statusMsg := tgbotapi.NewMessage(message.Chat.ID, errorMsg)
+			if _, err := bot.Send(statusMsg); err != nil {
+				log.Printf("Error sending file type error message: %v", err)
+			}
+
+			log.Printf("File %s rejected: extension '%s' not in allowed list %v", fileName, fileExt, allowedExtensions)
+			return fmt.Errorf("file extension '%s' not allowed", fileExt)
+		}
+	}
+
+	// Check file size limit
+	if fileSize > TelegramMaxFileSize {
+		errorMsg := fmt.Sprintf("❌ File too large: %s\n📊 Size: %s\n🚫 Telegram limit: %s\n\n💡 Suggestions:\n• Use cloud storage (Google Drive, Dropbox, etc.)\n• Compress the file\n• Split into smaller parts\n• Send a download link instead",
+			fileName, formatBytes(fileSize), formatBytes(TelegramMaxFileSize))
+
+		statusMsg := tgbotapi.NewMessage(message.Chat.ID, errorMsg)
+		if _, err := bot.Send(statusMsg); err != nil {
+			log.Printf("Error sending file size error message: %v", err)
+		}
+
+		log.Printf("File %s rejected: size %d bytes exceeds %d bytes limit", fileName, fileSize, TelegramMaxFileSize)
+		return fmt.Errorf("file size %d bytes exceeds Telegram limit of %d bytes", fileSize, TelegramMaxFileSize)
+	}
+
 	// Send initial download message
-	statusMsg := tgbotapi.NewMessage(message.Chat.ID, fmt.Sprintf("📥 Downloading: %s\n⏳ Starting download...", fileName))
+	statusMsg := tgbotapi.NewMessage(message.Chat.ID, fmt.Sprintf("📥 Downloading: %s\n📊 Size: %s\n⏳ Starting download...", fileName, formatBytes(fileSize)))
 	sentMsg, err := bot.Send(statusMsg)
 	if err != nil {
 		log.Printf("Error sending status message: %v", err)
@@ -141,8 +211,14 @@ func downloadFileWithProgress(bot *tgbotapi.BotAPI, fileID, fileName, downloadFo
 	fileConfig := tgbotapi.FileConfig{FileID: fileID}
 	file, err := bot.GetFile(fileConfig)
 	if err != nil {
-		updateStatusMessage(bot, chatID, messageID, fmt.Sprintf("❌ Error getting file info: %s", fileName))
+		updateStatusMessage(bot, chatID, messageID, fmt.Sprintf("❌ Error getting file info: %s\n🔍 This might be due to file size restrictions", fileName))
 		return fmt.Errorf("failed to get file info: %w", err)
+	}
+
+	// Double-check file size from API response
+	if file.FileSize > TelegramMaxFileSize {
+		updateStatusMessage(bot, chatID, messageID, fmt.Sprintf("❌ File too large: %s\n📊 Size: %s\n🚫 Telegram API limit: %s", fileName, formatBytes(int64(file.FileSize)), formatBytes(TelegramMaxFileSize)))
+		return fmt.Errorf("file size %d bytes exceeds Telegram API limit", file.FileSize)
 	}
 
 	// Create file URL
@@ -162,29 +238,41 @@ func downloadFileWithProgress(bot *tgbotapi.BotAPI, fileID, fileName, downloadFo
 	finalFileName := filepath.Base(filePath)
 
 	// Update status: starting download
-	updateStatusMessage(bot, chatID, messageID, fmt.Sprintf("📥 Downloading: %s\n🔄 Connecting...", finalFileName))
+	updateStatusMessage(bot, chatID, messageID, fmt.Sprintf("📥 Downloading: %s\n📊 Size: %s\n🔄 Connecting...", finalFileName, formatBytes(fileSize)))
 
 	// Download file
 	log.Printf("Downloading file: %s", finalFileName)
 	resp, err := http.Get(fileURL)
 	if err != nil {
-		updateStatusMessage(bot, chatID, messageID, fmt.Sprintf("❌ Download failed: %s", finalFileName))
+		updateStatusMessage(bot, chatID, messageID, fmt.Sprintf("❌ Download failed: %s\n🌐 Network error occurred", finalFileName))
 		return fmt.Errorf("failed to download file: %w", err)
 	}
 	defer resp.Body.Close()
 
+	// Check HTTP response status
+	if resp.StatusCode != http.StatusOK {
+		updateStatusMessage(bot, chatID, messageID, fmt.Sprintf("❌ Download failed: %s\n📡 Server returned: %s", finalFileName, resp.Status))
+		return fmt.Errorf("HTTP error: %s", resp.Status)
+	}
+
 	// Create local file
 	outFile, err := os.Create(filePath)
 	if err != nil {
-		updateStatusMessage(bot, chatID, messageID, fmt.Sprintf("❌ Error creating file: %s", finalFileName))
+		updateStatusMessage(bot, chatID, messageID, fmt.Sprintf("❌ Error creating file: %s\n💾 Check disk space and permissions", finalFileName))
 		return fmt.Errorf("failed to create local file: %w", err)
 	}
 	defer outFile.Close()
 
+	// Use actual file size from response if available
+	actualFileSize := fileSize
+	if resp.ContentLength > 0 {
+		actualFileSize = resp.ContentLength
+	}
+
 	// Create progress reader
 	progressReader := &ProgressReader{
 		Reader:     resp.Body,
-		Total:      fileSize,
+		Total:      actualFileSize,
 		bot:        bot,
 		chatID:     chatID,
 		messageID:  messageID,
@@ -195,12 +283,19 @@ func downloadFileWithProgress(bot *tgbotapi.BotAPI, fileID, fileName, downloadFo
 	// Copy file content with progress
 	bytesWritten, err := io.Copy(outFile, progressReader)
 	if err != nil {
-		updateStatusMessage(bot, chatID, messageID, fmt.Sprintf("❌ Download failed: %s", finalFileName))
+		updateStatusMessage(bot, chatID, messageID, fmt.Sprintf("❌ Download failed: %s\n💾 Error writing to disk", finalFileName))
 		return fmt.Errorf("failed to save file: %w", err)
 	}
 
 	// Update final status
-	updateStatusMessage(bot, chatID, messageID, fmt.Sprintf("✅ Downloaded: %s\n📊 Size: %s", finalFileName, formatBytes(bytesWritten)))
+	duration := time.Since(progressReader.lastUpdate)
+	avgSpeed := formatBytes(bytesWritten) + "/s"
+	if duration.Seconds() > 0 {
+		avgSpeed = formatBytes(int64(float64(bytesWritten)/duration.Seconds())) + "/s"
+	}
+
+	updateStatusMessage(bot, chatID, messageID, fmt.Sprintf("✅ Downloaded: %s\n📊 Size: %s\n⚡ Avg Speed: %s\n📁 Saved to: %s",
+		finalFileName, formatBytes(bytesWritten), avgSpeed, downloadFolder))
 
 	log.Printf("Successfully downloaded: %s (%d bytes)", filePath, bytesWritten)
 	return nil
@@ -234,18 +329,36 @@ func (pr *ProgressReader) Read(p []byte) (n int, err error) {
 
 func (pr *ProgressReader) updateProgress() {
 	if pr.Total <= 0 {
+		// Handle unknown file size
+		status := fmt.Sprintf("📥 Downloading: %s\n🔄 Progress: %s downloaded\n⏱️ In progress...",
+			pr.fileName,
+			formatBytes(pr.Current))
+		updateStatusMessage(pr.bot, pr.chatID, pr.messageID, status)
 		return
 	}
 
 	percentage := float64(pr.Current) / float64(pr.Total) * 100
 	progressBar := createProgressBar(percentage)
 
-	status := fmt.Sprintf("📥 Downloading: %s\n%s %.1f%%\n📊 %s / %s",
+	// Calculate estimated time remaining
+	elapsed := time.Since(pr.lastUpdate)
+	var eta string
+	if pr.Current > 0 && elapsed.Seconds() > 0 {
+		bytesPerSecond := float64(pr.Current) / elapsed.Seconds()
+		remainingBytes := pr.Total - pr.Current
+		if bytesPerSecond > 0 {
+			etaSeconds := float64(remainingBytes) / bytesPerSecond
+			eta = fmt.Sprintf(" • ETA: %s", formatDuration(time.Duration(etaSeconds)*time.Second))
+		}
+	}
+
+	status := fmt.Sprintf("📥 Downloading: %s\n%s %.1f%%\n📊 %s / %s%s",
 		pr.fileName,
 		progressBar,
 		percentage,
 		formatBytes(pr.Current),
-		formatBytes(pr.Total))
+		formatBytes(pr.Total),
+		eta)
 
 	updateStatusMessage(pr.bot, pr.chatID, pr.messageID, status)
 }
@@ -281,9 +394,39 @@ func formatBytes(bytes int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
+// formatDuration formats a duration into human readable format
+func formatDuration(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%.0fs", d.Seconds())
+	} else if d < time.Hour {
+		return fmt.Sprintf("%.0fm %.0fs", d.Minutes(), d.Seconds()-60*float64(int(d.Minutes())))
+	}
+	return fmt.Sprintf("%.0fh %.0fm", d.Hours(), d.Minutes()-60*float64(int(d.Hours())))
+}
+
 // downloadFile downloads a file from Telegram servers (legacy function - kept for compatibility)
 func downloadFile(bot *tgbotapi.BotAPI, fileID, fileName, downloadFolder string, fileSize int64) error {
 	return downloadFileWithProgress(bot, fileID, fileName, downloadFolder, fileSize, 0, 0)
+}
+
+// isAllowedFileType checks if a filename has an allowed extension
+func isAllowedFileType(filename string, allowedExtensions []string) bool {
+	if len(allowedExtensions) == 0 {
+		return true // No restrictions
+	}
+
+	ext := strings.ToLower(filepath.Ext(filename))
+	if ext != "" && strings.HasPrefix(ext, ".") {
+		ext = ext[1:] // Remove the dot
+	}
+
+	for _, allowedExt := range allowedExtensions {
+		if ext == allowedExt {
+			return true
+		}
+	}
+
+	return false
 }
 
 // sanitizeFilename removes or replaces invalid characters in filename
