@@ -30,17 +30,18 @@ const (
 )
 
 type Config struct {
-	APIID          int
-	APIHash        string
-	Phone          string
-	DownloadFolder string
-	ChannelID      int64
-	AllowedUserID  int64
-	Debug          bool
-	AllowedTypes   []string
-	SessionFile    string
-	CodeFile       string
-	PasswordFile   string
+	APIID             int
+	APIHash           string
+	Phone             string
+	DownloadFolder    string
+	ChannelID         int64
+	ChannelAccessHash int64 // Store channel access hash
+	AllowedUserID     int64
+	Debug             bool
+	AllowedTypes      []string
+	SessionFile       string
+	CodeFile          string
+	PasswordFile      string
 }
 
 func main() {
@@ -239,17 +240,59 @@ func sendGreeting(ctx context.Context, client *telegram.Client, config *Config) 
 
 	// If channel mode, send to channel
 	if config.ChannelID != 0 {
-		target := &tg.InputPeerChannel{
-			ChannelID:  config.ChannelID,
-			AccessHash: 0, // Will be resolved
+		// First, get all dialogs to find the channel and get its access hash
+		dialogs, err := client.API().MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{
+			OffsetPeer: &tg.InputPeerEmpty{},
+			Limit:      100,
+		})
+
+		if err != nil {
+			log.Printf("Could not fetch dialogs: %v", err)
+			log.Printf("💡 Bot will work once you send first message to the channel")
+			return nil
 		}
 
-		_, err := sender.To(target).Text(ctx, greetingMsg)
+		var channelAccessHash int64
+		var found bool
+
+		// Find the channel in dialogs
+		switch d := dialogs.(type) {
+		case *tg.MessagesDialogs:
+			for _, chat := range d.Chats {
+				if channel, ok := chat.(*tg.Channel); ok && channel.ID == config.ChannelID {
+					channelAccessHash = channel.AccessHash
+					found = true
+					break
+				}
+			}
+		case *tg.MessagesDialogsSlice:
+			for _, chat := range d.Chats {
+				if channel, ok := chat.(*tg.Channel); ok && channel.ID == config.ChannelID {
+					channelAccessHash = channel.AccessHash
+					found = true
+					break
+				}
+			}
+		}
+
+		if !found {
+			log.Printf("Channel %d not found in dialogs", config.ChannelID)
+			log.Printf("💡 Make sure bot account is a member of the channel")
+			log.Printf("💡 Send a message to the channel first, then restart the bot")
+			return nil
+		}
+
+		// Store the access hash in config for later use
+		config.ChannelAccessHash = channelAccessHash
+
+		target := &tg.InputPeerChannel{
+			ChannelID:  config.ChannelID,
+			AccessHash: channelAccessHash,
+		}
+
+		_, err = sender.To(target).Text(ctx, greetingMsg)
 		if err != nil {
 			log.Printf("Could not send greeting to channel: %v", err)
-			log.Printf("💡 Make sure:")
-			log.Printf("   1. Bot account is a member of the channel/group")
-			log.Printf("   2. Channel ID is correct (use negative ID for supergroups)")
 			return nil
 		}
 
@@ -322,11 +365,10 @@ func handleMessage(ctx context.Context, client *telegram.Client, entities tg.Ent
 				return nil // Not from our channel
 			}
 
-			// For channels, we can use the channel ID from config
-			// The access hash will be resolved by the sender
+			// Use the access hash from config (set during greeting/initialization)
 			peer = &tg.InputPeerChannel{
 				ChannelID:  p.ChannelID,
-				AccessHash: 0, // Will be resolved by library
+				AccessHash: config.ChannelAccessHash,
 			}
 
 			// Get sender user ID from message
