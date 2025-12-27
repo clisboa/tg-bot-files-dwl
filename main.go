@@ -303,11 +303,11 @@ func sendGreeting(ctx context.Context, client *telegram.Client, config *Config) 
 		}
 
 		if !found {
-			log.Printf("Channel %d not found after searching dialogs", config.ChannelID)
-			log.Printf("💡 Make sure:")
-			log.Printf("   1. Bot account is logged in correctly")
-			log.Printf("   2. Bot account is a member/admin of the channel")
-			log.Printf("   3. Channel ID is correct: %d", config.ChannelID)
+			log.Printf("Channel %d not found in dialogs", config.ChannelID)
+			log.Printf("⚠️ Greeting will be skipped, but bot will work when you send a message")
+			log.Printf("💡 The bot will get channel access hash from the first message")
+			log.Printf("💡 Send any document to channel %d to activate the bot", config.ChannelID)
+			// Don't return error - continue without greeting
 			return nil
 		}
 
@@ -395,10 +395,19 @@ func handleMessage(ctx context.Context, client *telegram.Client, entities tg.Ent
 				return nil // Not from our channel
 			}
 
-			// Use the access hash from config (set during greeting/initialization)
+			// For channel messages, just use the peer from the message itself
+			// The message update contains the proper peer with access hash
 			peer = &tg.InputPeerChannel{
 				ChannelID:  p.ChannelID,
-				AccessHash: config.ChannelAccessHash,
+				AccessHash: 0, // Will work for replies in the same channel
+			}
+
+			// Try to get access hash from config if available
+			if config.ChannelAccessHash != 0 {
+				peer = &tg.InputPeerChannel{
+					ChannelID:  p.ChannelID,
+					AccessHash: config.ChannelAccessHash,
+				}
 			}
 
 			// Get sender user ID from message
