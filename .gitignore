@@ -1,13 +1,46 @@
-.vscode/*
-!.vscode/settings.json
-!.vscode/tasks.json
-!.vscode/launch.json
-!.vscode/extensions.json
-!.vscode/*.code-snippets
-!*.code-workspace
+# Binaries
+tg-bot-files-dwl
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
 
-# Built Visual Studio Code Extensions
-*.vsix
+# Test binary
+*.test
 
-#downloads test folder
-downloads/*
+# Output of the go coverage tool
+*.out
+
+# Dependency directories
+vendor/
+
+# Go workspace file
+go.work
+
+# Environment files
+.env
+.env.local
+
+# Session files (IMPORTANT: Never commit these!)
+session.json
+*.session
+
+# Authentication files (auto-deleted but just in case)
+telegram_code.txt
+telegram_password.txt
+
+# Downloads folder
+downloads/
+*.tmp
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

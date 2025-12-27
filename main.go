@@ -1,61 +1,103 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
 	"log"
-	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/gotd/contrib/middleware/floodwait"
+	"github.com/gotd/contrib/middleware/ratelimit"
+	"github.com/gotd/td/telegram"
+	"github.com/gotd/td/telegram/auth"
+	"github.com/gotd/td/telegram/downloader"
+	"github.com/gotd/td/telegram/message"
+	"github.com/gotd/td/telegram/updates"
+	"github.com/gotd/td/tg"
+	"golang.org/x/time/rate"
 )
 
 const (
-	// Telegram Bot API file size limit
-	TelegramMaxFileSize = 20 * 1024 * 1024 // 20MB in bytes
+	// Client API supports files up to 2GB
+	MaxFileSize = 2 * 1024 * 1024 * 1024 // 2GB in bytes
 )
+
+type Config struct {
+	APIID          int
+	APIHash        string
+	Phone          string
+	DownloadFolder string
+	AllowedUserID  int64
+	Debug          bool
+	AllowedTypes   []string
+	SessionFile    string
+	CodeFile       string
+	PasswordFile   string
+}
 
 func main() {
 	// Parse command line arguments
 	var (
-		botToken     = flag.String("token", os.Getenv("TELEGRAM_BOT_TOKEN"), "Telegram bot token")
+		apiID        = flag.Int("api-id", 0, "Telegram API ID from https://my.telegram.org")
+		apiHash      = flag.String("api-hash", os.Getenv("TELEGRAM_API_HASH"), "Telegram API Hash from https://my.telegram.org")
+		phone        = flag.String("phone", os.Getenv("TELEGRAM_PHONE"), "Phone number (with country code, e.g., +1234567890)")
 		folder       = flag.String("folder", os.Getenv("TELEGRAM_FOLDER"), "Download folder path")
 		allowedUID   = flag.String("user", os.Getenv("TELEGRAM_USER_ID"), "Allowed user ID (required)")
 		debug        = flag.String("debug", os.Getenv("TELEGRAM_DEBUG"), "Debug mode? (optional - true or false/leave empty for off)")
 		allowedTypes = flag.String("types", os.Getenv("TELEGRAM_ALLOWED_TYPES"), "Comma-separated list of allowed file extensions (e.g., pdf,txt,docx). Leave empty to allow all types")
+		sessionFile  = flag.String("session", "session.json", "Session file path for storing authentication")
+		codeFile     = flag.String("code-file", getEnvOrDefault("TELEGRAM_CODE_FILE", "telegram_code.txt"), "File to read verification code from (will wait for file creation)")
+		passwordFile = flag.String("password-file", getEnvOrDefault("TELEGRAM_PASSWORD_FILE", "telegram_password.txt"), "File to read 2FA password from (optional)")
 	)
 	flag.Parse()
 
+	// Get API ID from environment if not set via flag
+	if *apiID == 0 {
+		if envID := os.Getenv("TELEGRAM_API_ID"); envID != "" {
+			var err error
+			*apiID, err = strconv.Atoi(envID)
+			if err != nil {
+				log.Fatalf("Invalid API ID: %v", err)
+			}
+		}
+	}
+
 	// Validate required parameters
-	if *botToken == "" {
-		log.Fatal("Bot token is required. Use -token flag or environment variable TELEGRAM_BOT_TOKEN")
+	if *apiID == 0 {
+		log.Fatal("API ID is required. Get it from https://my.telegram.org and use -api-id flag or TELEGRAM_API_ID environment variable")
+	}
+	if *apiHash == "" {
+		log.Fatal("API Hash is required. Get it from https://my.telegram.org and use -api-hash flag or TELEGRAM_API_HASH environment variable")
+	}
+	if *phone == "" {
+		log.Fatal("Phone number is required. Use -phone flag or TELEGRAM_PHONE environment variable")
 	}
 	if *folder == "" {
-		log.Fatal("Download folder path is required. Use -folder flag or environment variable TELEGRAM_FOLDER")
+		log.Fatal("Download folder path is required. Use -folder flag or TELEGRAM_FOLDER environment variable")
 	}
 	if *allowedUID == "" {
-		log.Fatal("Allowed user ID is required. Use -user flag or environment variable TELEGRAM_USER_ID")
+		log.Fatal("Allowed user ID is required. Use -user flag or TELEGRAM_USER_ID environment variable")
 	}
-	if *debug == "" {
-		log.Printf("Debug mode off")
-		*debug = "false"
-	} else {
-		log.Printf("Debug mode on")
+
+	debugMode := false
+	if *debug != "" {
+		debugMode, _ = strconv.ParseBool(*debug)
 	}
 
 	// Parse and validate allowed file types
 	var allowedExtensions []string
 	if *allowedTypes != "" {
-		extensions := strings.Split(*allowedTypes, ",")
-		for _, ext := range extensions {
+		extensions := strings.SplitSeq(*allowedTypes, ",")
+		for ext := range extensions {
 			ext = strings.TrimSpace(ext)
 			if ext != "" {
-				// Normalize extension (remove leading dot, convert to lowercase)
 				ext = strings.TrimPrefix(ext, ".")
 				allowedExtensions = append(allowedExtensions, strings.ToLower(ext))
 			}
@@ -70,165 +112,238 @@ func main() {
 		log.Fatalf("Failed to create download folder: %v", err)
 	}
 
-	// Initialize bot
-	bot, err := tgbotapi.NewBotAPI(*botToken)
-	if err != nil {
-		log.Fatalf("Failed to initialize bot: %v", err)
-	}
-
-	bot.Debug, _ = strconv.ParseBool(*debug)
-	log.Printf("Authorized on account %s", bot.Self.UserName)
-	log.Printf("Monitoring direct chats for documents")
-	log.Printf("Download folder: %s", *folder)
-	log.Printf("Allowed user ID: %s", *allowedUID)
-
 	// Convert allowed user ID to int64
 	allowedUserID, err := strconv.ParseInt(*allowedUID, 10, 64)
 	if err != nil {
 		log.Fatalf("Invalid user ID format: %v", err)
 	}
 
-	// Send initial greeting message to the allowed user
-	timestamp := time.Now().Format("2006-01-02 15:04:05")
-	greetingMsg := fmt.Sprintf("[%s] Hi, show me the docs!\n\n📋 File size limit: %s", timestamp, formatBytes(TelegramMaxFileSize))
+	config := &Config{
+		APIID:          *apiID,
+		APIHash:        *apiHash,
+		Phone:          *phone,
+		DownloadFolder: *folder,
+		AllowedUserID:  allowedUserID,
+		Debug:          debugMode,
+		AllowedTypes:   allowedExtensions,
+		SessionFile:    *sessionFile,
+		CodeFile:       *codeFile,
+		PasswordFile:   *passwordFile,
+	}
 
-	if len(allowedExtensions) > 0 {
-		greetingMsg += fmt.Sprintf("\n📎 Allowed types: %s", strings.Join(allowedExtensions, ", "))
+	log.Printf("Download folder: %s", config.DownloadFolder)
+	log.Printf("Allowed user ID: %d", config.AllowedUserID)
+	log.Printf("Session file: %s", config.SessionFile)
+	log.Printf("File size limit: %s (Client API)", formatBytes(MaxFileSize))
+
+	// Run the bot
+	if err := runBot(context.Background(), config); err != nil {
+		log.Fatalf("Bot error: %v", err)
+	}
+}
+
+func runBot(ctx context.Context, config *Config) error {
+	// Create client with session storage
+	client := telegram.NewClient(config.APIID, config.APIHash, telegram.Options{
+		SessionStorage: &telegram.FileSessionStorage{
+			Path: config.SessionFile,
+		},
+		Middlewares: []telegram.Middleware{
+			floodwait.NewSimpleWaiter().WithMaxRetries(3),
+			ratelimit.New(rate.Every(time.Millisecond*100), 5),
+		},
+	})
+
+	// Authentication flow
+	flow := auth.NewFlow(
+		fileAuth{
+			phone:        config.Phone,
+			codeFile:     config.CodeFile,
+			passwordFile: config.PasswordFile,
+		},
+		auth.SendCodeOptions{},
+	)
+
+	return client.Run(ctx, func(ctx context.Context) error {
+		// Authenticate
+		if err := client.Auth().IfNecessary(ctx, flow); err != nil {
+			return fmt.Errorf("authentication failed: %w", err)
+		}
+
+		log.Println("Authentication successful!")
+
+		// Get current user info
+		user, err := client.Self(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to get current user: %w", err)
+		}
+
+		log.Printf("Logged in as: %s %s (ID: %d)", user.FirstName, user.LastName, user.ID)
+
+		// Send greeting message to allowed user
+		if err := sendGreeting(ctx, client, config); err != nil {
+			log.Printf("Error sending greeting: %v", err)
+		}
+
+		// Set up message handler
+		dispatcher := tg.NewUpdateDispatcher()
+		gaps := updates.New(updates.Config{
+			Handler: dispatcher,
+		})
+
+		// Register message handler
+		dispatcher.OnNewMessage(func(ctx context.Context, e tg.Entities, update *tg.UpdateNewMessage) error {
+			return handleMessage(ctx, client, update, config)
+		})
+
+		// Start handling updates
+		log.Println("Bot is running... Monitoring for documents")
+		return gaps.Run(ctx, client.API(), user.ID, updates.AuthOptions{
+			OnStart: func(ctx context.Context) {
+				log.Println("Update gap handler started")
+			},
+		})
+	})
+}
+
+func sendGreeting(ctx context.Context, client *telegram.Client, config *Config) error {
+	sender := message.NewSender(client.API())
+
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+	greetingMsg := fmt.Sprintf("[%s] Hi, show me the docs!\n\n📋 File size limit: %s", timestamp, formatBytes(MaxFileSize))
+
+	if len(config.AllowedTypes) > 0 {
+		greetingMsg += fmt.Sprintf("\n📎 Allowed types: %s", strings.Join(config.AllowedTypes, ", "))
 	} else {
 		greetingMsg += "\n📎 All file types accepted"
 	}
 
-	greetingMsg += "\n💡 For larger files, consider using cloud storage services."
+	greetingMsg += "\n💡 Using Client API - supports files up to 2GB!"
 
-	initialMsg := tgbotapi.NewMessage(allowedUserID, greetingMsg)
-	if _, err := bot.Send(initialMsg); err != nil {
-		log.Printf("Error sending initial message: %v", err)
-	} else {
-		log.Printf("Sent initial greeting to user %d", allowedUserID)
+	_, err := sender.To(&tg.InputPeerUser{
+		UserID: config.AllowedUserID,
+	}).Text(ctx, greetingMsg)
+
+	if err != nil {
+		return fmt.Errorf("failed to send greeting: %w", err)
 	}
 
-	// Configure updates
-	u := tgbotapi.NewUpdate(0)
-	u.Timeout = 60
-
-	updates := bot.GetUpdatesChan(u)
-
-	// Process updates
-	for update := range updates {
-		if update.Message == nil {
-			continue
-		}
-
-		message := update.Message
-
-		// Only handle private chats (direct messages)
-		if !message.Chat.IsPrivate() {
-			continue
-		}
-
-		// Check if message is from allowed user
-		if message.From.ID != allowedUserID {
-			log.Printf("Ignoring message from unauthorized user: %s (ID: %d)",
-				message.From.UserName, message.From.ID)
-			continue
-		}
-
-		// Handle document messages only
-		if err := handleDocumentMessage(bot, message, *folder, allowedExtensions); err != nil {
-			log.Printf("Error handling document: %v", err)
-		}
-	}
+	log.Printf("Sent greeting to user %d", config.AllowedUserID)
+	return nil
 }
 
-// handleDocumentMessage processes messages that contain documents only
-func handleDocumentMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, downloadFolder string, allowedExtensions []string) error {
-	// Only handle document messages
-	if message.Document == nil {
+func handleMessage(ctx context.Context, client *telegram.Client, update *tg.UpdateNewMessage, config *Config) error {
+	msg, ok := update.Message.(*tg.Message)
+	if !ok {
 		return nil
 	}
 
-	fileID := message.Document.FileID
-	fileName := message.Document.FileName
-	fileSize := int64(message.Document.FileSize)
+	// Only handle private messages
+	peer, ok := msg.PeerID.(*tg.PeerUser)
+	if !ok {
+		return nil
+	}
 
-	log.Printf("Found document from user %s: %s (size: %d bytes)",
-		message.From.UserName, fileName, fileSize)
+	// Check if message is from allowed user
+	if peer.UserID != config.AllowedUserID {
+		log.Printf("Ignoring message from unauthorized user ID: %d", peer.UserID)
+		return nil
+	}
+
+	// Handle document messages only
+	media, ok := msg.Media.(*tg.MessageMediaDocument)
+	if !ok {
+		return nil
+	}
+
+	doc, ok := media.Document.(*tg.Document)
+	if !ok {
+		return nil
+	}
+
+	// Get document attributes
+	var fileName string
+	var fileSize int64 = doc.Size
+
+	for _, attr := range doc.Attributes {
+		if nameAttr, ok := attr.(*tg.DocumentAttributeFilename); ok {
+			fileName = nameAttr.FileName
+			break
+		}
+	}
+
+	if fileName == "" {
+		fileName = fmt.Sprintf("document_%d", doc.ID)
+	}
+
+	log.Printf("Found document from user %d: %s (size: %d bytes)", peer.UserID, fileName, fileSize)
 
 	// Check file type if restrictions are enabled
-	if len(allowedExtensions) > 0 {
-		if !isAllowedFileType(fileName, allowedExtensions) {
+	if len(config.AllowedTypes) > 0 {
+		if !isAllowedFileType(fileName, config.AllowedTypes) {
 			fileExt := strings.ToLower(filepath.Ext(fileName))
 			if fileExt != "" && strings.HasPrefix(fileExt, ".") {
-				fileExt = fileExt[1:] // Remove the dot
+				fileExt = fileExt[1:]
 			}
 
 			errorMsg := fmt.Sprintf("❌ File type not allowed: %s\n📎 Extension: %s\n✅ Allowed types: %s\n\n💡 Please convert your file to an allowed format or contact the administrator to add this file type.",
 				fileName,
 				fileExt,
-				strings.Join(allowedExtensions, ", "))
+				strings.Join(config.AllowedTypes, ", "))
 
-			statusMsg := tgbotapi.NewMessage(message.Chat.ID, errorMsg)
-			if _, err := bot.Send(statusMsg); err != nil {
+			sender := message.NewSender(client.API())
+			_, err := sender.To(&tg.InputPeerUser{UserID: peer.UserID}).Text(ctx, errorMsg)
+			if err != nil {
 				log.Printf("Error sending file type error message: %v", err)
 			}
 
-			log.Printf("File %s rejected: extension '%s' not in allowed list %v", fileName, fileExt, allowedExtensions)
+			log.Printf("File %s rejected: extension '%s' not in allowed list %v", fileName, fileExt, config.AllowedTypes)
 			return fmt.Errorf("file extension '%s' not allowed", fileExt)
 		}
 	}
 
-	// Check file size limit
-	if fileSize > TelegramMaxFileSize {
-		errorMsg := fmt.Sprintf("❌ File too large: %s\n📊 Size: %s\n🚫 Telegram limit: %s\n\n💡 Suggestions:\n• Use cloud storage (Google Drive, Dropbox, etc.)\n• Compress the file\n• Split into smaller parts\n• Send a download link instead",
-			fileName, formatBytes(fileSize), formatBytes(TelegramMaxFileSize))
+	// Check file size limit (2GB for Client API)
+	if fileSize > MaxFileSize {
+		errorMsg := fmt.Sprintf("❌ File too large: %s\n📊 Size: %s\n🚫 Maximum limit: %s\n\n💡 Even with Client API, files larger than 2GB are not supported by Telegram.",
+			fileName, formatBytes(fileSize), formatBytes(MaxFileSize))
 
-		statusMsg := tgbotapi.NewMessage(message.Chat.ID, errorMsg)
-		if _, err := bot.Send(statusMsg); err != nil {
+		sender := message.NewSender(client.API())
+		_, err := sender.To(&tg.InputPeerUser{UserID: peer.UserID}).Text(ctx, errorMsg)
+		if err != nil {
 			log.Printf("Error sending file size error message: %v", err)
 		}
 
-		log.Printf("File %s rejected: size %d bytes exceeds %d bytes limit", fileName, fileSize, TelegramMaxFileSize)
-		return fmt.Errorf("file size %d bytes exceeds Telegram limit of %d bytes", fileSize, TelegramMaxFileSize)
+		log.Printf("File %s rejected: size %d bytes exceeds %d bytes limit", fileName, fileSize, MaxFileSize)
+		return fmt.Errorf("file size %d bytes exceeds maximum limit of %d bytes", fileSize, MaxFileSize)
 	}
 
 	// Send initial download message
-	statusMsg := tgbotapi.NewMessage(message.Chat.ID, fmt.Sprintf("📥 Downloading: %s\n📊 Size: %s\n⏳ Starting download...", fileName, formatBytes(fileSize)))
-	sentMsg, err := bot.Send(statusMsg)
+	sender := message.NewSender(client.API())
+	statusMsg := fmt.Sprintf("📥 Downloading: %s\n📊 Size: %s\n⏳ Starting download...", fileName, formatBytes(fileSize))
+
+	upd, err := sender.To(&tg.InputPeerUser{UserID: peer.UserID}).Text(ctx, statusMsg)
+	var messageID int
 	if err != nil {
 		log.Printf("Error sending status message: %v", err)
-		// Continue with download even if status message fails
+		messageID = 0
+	} else {
+		// Extract message ID from the updates
+		switch u := upd.(type) {
+		case *tg.Updates:
+			if len(u.Updates) > 0 {
+				if msgUpdate, ok := u.Updates[0].(*tg.UpdateMessageID); ok {
+					messageID = msgUpdate.ID
+				}
+			}
+		}
 	}
 
 	// Download the document with progress updates
-	err = downloadFileWithProgress(bot, fileID, fileName, downloadFolder, fileSize, message.Chat.ID, sentMsg.MessageID)
-
+	err = downloadDocument(ctx, client, doc, fileName, config.DownloadFolder, fileSize, peer.UserID, messageID)
 	return err
 }
 
-// downloadFileWithProgress downloads a file from Telegram servers with progress updates
-func downloadFileWithProgress(bot *tgbotapi.BotAPI, fileID, fileName, downloadFolder string, fileSize int64, chatID int64, messageID int) error {
-	// Get file info from Telegram
-	fileConfig := tgbotapi.FileConfig{FileID: fileID}
-	file, err := bot.GetFile(fileConfig)
-	if err != nil {
-		updateStatusMessage(bot, chatID, messageID, fmt.Sprintf("❌ Error getting file info: %s\n🔍 This might be due to file size restrictions", fileName))
-		return fmt.Errorf("failed to get file info: %w", err)
-	}
-
-	// Double-check file size from API response
-	if file.FileSize > TelegramMaxFileSize {
-		updateStatusMessage(bot, chatID, messageID, fmt.Sprintf("❌ File too large: %s\n📊 Size: %s\n🚫 Telegram API limit: %s", fileName, formatBytes(int64(file.FileSize)), formatBytes(TelegramMaxFileSize)))
-		return fmt.Errorf("file size %d bytes exceeds Telegram API limit", file.FileSize)
-	}
-
-	// Create file URL
-	fileURL := file.Link(bot.Token)
-
-	// Create full file path
-	if fileName == "" {
-		fileName = fmt.Sprintf("file_%s", file.FileID)
-	}
-
+func downloadDocument(ctx context.Context, client *telegram.Client, doc *tg.Document, fileName, downloadFolder string, fileSize int64, userID int64, messageID int) error {
 	// Sanitize filename
 	fileName = sanitizeFilename(fileName)
 	filePath := filepath.Join(downloadFolder, fileName)
@@ -238,114 +353,116 @@ func downloadFileWithProgress(bot *tgbotapi.BotAPI, fileID, fileName, downloadFo
 	finalFileName := filepath.Base(filePath)
 
 	// Update status: starting download
-	updateStatusMessage(bot, chatID, messageID, fmt.Sprintf("📥 Downloading: %s\n📊 Size: %s\n🔄 Connecting...", finalFileName, formatBytes(fileSize)))
+	updateStatusMessage(ctx, client, userID, messageID, fmt.Sprintf("📥 Downloading: %s\n📊 Size: %s\n🔄 Connecting...", finalFileName, formatBytes(fileSize)))
 
-	// Download file
 	log.Printf("Downloading file: %s", finalFileName)
-	resp, err := http.Get(fileURL)
-	if err != nil {
-		updateStatusMessage(bot, chatID, messageID, fmt.Sprintf("❌ Download failed: %s\n🌐 Network error occurred", finalFileName))
-		return fmt.Errorf("failed to download file: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// Check HTTP response status
-	if resp.StatusCode != http.StatusOK {
-		updateStatusMessage(bot, chatID, messageID, fmt.Sprintf("❌ Download failed: %s\n📡 Server returned: %s", finalFileName, resp.Status))
-		return fmt.Errorf("HTTP error: %s", resp.Status)
-	}
 
 	// Create local file
 	outFile, err := os.Create(filePath)
 	if err != nil {
-		updateStatusMessage(bot, chatID, messageID, fmt.Sprintf("❌ Error creating file: %s\n💾 Check disk space and permissions", finalFileName))
+		updateStatusMessage(ctx, client, userID, messageID, fmt.Sprintf("❌ Error creating file: %s\n💾 Check disk space and permissions", finalFileName))
 		return fmt.Errorf("failed to create local file: %w", err)
 	}
 	defer outFile.Close()
 
-	// Use actual file size from response if available
-	actualFileSize := fileSize
-	if resp.ContentLength > 0 {
-		actualFileSize = resp.ContentLength
-	}
+	// Create downloader
+	d := downloader.NewDownloader()
 
-	// Create progress reader
-	progressReader := &ProgressReader{
-		Reader:     resp.Body,
-		Total:      actualFileSize,
-		bot:        bot,
-		chatID:     chatID,
+	// Create progress tracker
+	progress := &ProgressTracker{
+		Total:      fileSize,
+		client:     client,
+		userID:     userID,
 		messageID:  messageID,
 		fileName:   finalFileName,
 		lastUpdate: time.Now(),
+		startTime:  time.Now(),
 	}
 
-	// Copy file content with progress
-	bytesWritten, err := io.Copy(outFile, progressReader)
+	// Create file location
+	location := &tg.InputDocumentFileLocation{
+		ID:            doc.ID,
+		AccessHash:    doc.AccessHash,
+		FileReference: doc.FileReference,
+	}
+
+	// Download with progress tracking
+	_, err = d.Download(client.API(), location).
+		Stream(ctx, &progressWriter{
+			writer:   outFile,
+			progress: progress,
+		})
+
 	if err != nil {
-		updateStatusMessage(bot, chatID, messageID, fmt.Sprintf("❌ Download failed: %s\n💾 Error writing to disk", finalFileName))
-		return fmt.Errorf("failed to save file: %w", err)
+		updateStatusMessage(ctx, client, userID, messageID, fmt.Sprintf("❌ Download failed: %s\n🌐 Network error occurred", finalFileName))
+		return fmt.Errorf("failed to download file: %w", err)
 	}
 
 	// Update final status
-	duration := time.Since(progressReader.lastUpdate)
-	avgSpeed := formatBytes(bytesWritten) + "/s"
+	duration := time.Since(progress.startTime)
+	avgSpeed := formatBytes(progress.Current) + "/s"
 	if duration.Seconds() > 0 {
-		avgSpeed = formatBytes(int64(float64(bytesWritten)/duration.Seconds())) + "/s"
+		avgSpeed = formatBytes(int64(float64(progress.Current)/duration.Seconds())) + "/s"
 	}
 
-	updateStatusMessage(bot, chatID, messageID, fmt.Sprintf("✅ Downloaded: %s\n📊 Size: %s\n⚡ Avg Speed: %s\n📁 Saved to: %s",
-		finalFileName, formatBytes(bytesWritten), avgSpeed, downloadFolder))
+	updateStatusMessage(ctx, client, userID, messageID, fmt.Sprintf("✅ Downloaded: %s\n📊 Size: %s\n⚡ Avg Speed: %s\n📁 Saved to: %s",
+		finalFileName, formatBytes(progress.Current), avgSpeed, downloadFolder))
 
-	log.Printf("Successfully downloaded: %s (%d bytes)", filePath, bytesWritten)
+	log.Printf("Successfully downloaded: %s (%d bytes)", filePath, progress.Current)
 	return nil
 }
 
-// ProgressReader wraps an io.Reader to provide progress updates
-type ProgressReader struct {
-	Reader     io.Reader
+// ProgressTracker tracks download progress
+type ProgressTracker struct {
 	Total      int64
 	Current    int64
-	bot        *tgbotapi.BotAPI
-	chatID     int64
+	client     *telegram.Client
+	userID     int64
 	messageID  int
 	fileName   string
 	lastUpdate time.Time
+	startTime  time.Time
 }
 
-func (pr *ProgressReader) Read(p []byte) (n int, err error) {
-	n, err = pr.Reader.Read(p)
-	pr.Current += int64(n)
+type progressWriter struct {
+	writer   io.Writer
+	progress *ProgressTracker
+}
 
-	// Update progress every 2 seconds or when download completes
+func (pw *progressWriter) Write(p []byte) (n int, err error) {
+	n, err = pw.writer.Write(p)
+	pw.progress.Current += int64(n)
+
+	// Update progress every 2 seconds
 	now := time.Now()
-	if now.Sub(pr.lastUpdate) > 2*time.Second || err == io.EOF {
-		pr.updateProgress()
-		pr.lastUpdate = now
+	if now.Sub(pw.progress.lastUpdate) > 2*time.Second {
+		pw.progress.updateProgress()
+		pw.progress.lastUpdate = now
 	}
 
 	return n, err
 }
 
-func (pr *ProgressReader) updateProgress() {
-	if pr.Total <= 0 {
-		// Handle unknown file size
+func (pt *ProgressTracker) updateProgress() {
+	ctx := context.Background()
+
+	if pt.Total <= 0 {
 		status := fmt.Sprintf("📥 Downloading: %s\n🔄 Progress: %s downloaded\n⏱️ In progress...",
-			pr.fileName,
-			formatBytes(pr.Current))
-		updateStatusMessage(pr.bot, pr.chatID, pr.messageID, status)
+			pt.fileName,
+			formatBytes(pt.Current))
+		updateStatusMessage(ctx, pt.client, pt.userID, pt.messageID, status)
 		return
 	}
 
-	percentage := float64(pr.Current) / float64(pr.Total) * 100
+	percentage := float64(pt.Current) / float64(pt.Total) * 100
 	progressBar := createProgressBar(percentage)
 
 	// Calculate estimated time remaining
-	elapsed := time.Since(pr.lastUpdate)
+	elapsed := time.Since(pt.startTime)
 	var eta string
-	if pr.Current > 0 && elapsed.Seconds() > 0 {
-		bytesPerSecond := float64(pr.Current) / elapsed.Seconds()
-		remainingBytes := pr.Total - pr.Current
+	if pt.Current > 0 && elapsed.Seconds() > 0 {
+		bytesPerSecond := float64(pt.Current) / elapsed.Seconds()
+		remainingBytes := pt.Total - pt.Current
 		if bytesPerSecond > 0 {
 			etaSeconds := float64(remainingBytes) / bytesPerSecond
 			eta = fmt.Sprintf(" • ETA: %s", formatDuration(time.Duration(etaSeconds)*time.Second))
@@ -353,17 +470,124 @@ func (pr *ProgressReader) updateProgress() {
 	}
 
 	status := fmt.Sprintf("📥 Downloading: %s\n%s %.1f%%\n📊 %s / %s%s",
-		pr.fileName,
+		pt.fileName,
 		progressBar,
 		percentage,
-		formatBytes(pr.Current),
-		formatBytes(pr.Total),
+		formatBytes(pt.Current),
+		formatBytes(pt.Total),
 		eta)
 
-	updateStatusMessage(pr.bot, pr.chatID, pr.messageID, status)
+	updateStatusMessage(ctx, pt.client, pt.userID, pt.messageID, status)
 }
 
-// createProgressBar creates a visual progress bar
+func updateStatusMessage(ctx context.Context, client *telegram.Client, userID int64, messageID int, text string) {
+	sender := message.NewSender(client.API())
+	_, err := sender.To(&tg.InputPeerUser{UserID: userID}).Edit(messageID).Text(ctx, text)
+	if err != nil {
+		log.Printf("Error updating status message: %v", err)
+	}
+}
+
+// fileAuth implements auth.UserAuthenticator for file-based authentication
+type fileAuth struct {
+	phone        string
+	codeFile     string
+	passwordFile string
+}
+
+func (a fileAuth) Phone(_ context.Context) (string, error) {
+	return a.phone, nil
+}
+
+func (a fileAuth) Password(ctx context.Context) (string, error) {
+	log.Printf("2FA password required. Waiting for password in file: %s", a.passwordFile)
+	log.Printf("Please create the file and write your 2FA password to it")
+
+	password, err := waitForFileContent(ctx, a.passwordFile, 5*time.Minute)
+	if err != nil {
+		return "", err
+	}
+
+	// Delete the password file for security
+	os.Remove(a.passwordFile)
+	log.Printf("Password file deleted for security")
+
+	return password, nil
+}
+
+func (a fileAuth) Code(ctx context.Context, sentCode *tg.AuthSentCode) (string, error) {
+	log.Printf("===========================================")
+	log.Printf("VERIFICATION CODE REQUIRED")
+	log.Printf("===========================================")
+	log.Printf("A verification code has been sent to your Telegram app")
+	log.Printf("Please create the file: %s", a.codeFile)
+	log.Printf("Write the verification code to this file")
+	log.Printf("Waiting for code file (timeout: 5 minutes)...")
+	log.Printf("===========================================")
+
+	code, err := waitForFileContent(ctx, a.codeFile, 5*time.Minute)
+	if err != nil {
+		return "", err
+	}
+
+	// Delete the code file after reading
+	os.Remove(a.codeFile)
+	log.Printf("Verification code received and file deleted")
+
+	return code, nil
+}
+
+func (a fileAuth) AcceptTermsOfService(_ context.Context, tos tg.HelpTermsOfService) error {
+	return nil
+}
+
+func (a fileAuth) SignUp(_ context.Context) (auth.UserInfo, error) {
+	return auth.UserInfo{}, fmt.Errorf("signup not supported")
+}
+
+// waitForFileContent waits for a file to be created and reads its content
+func waitForFileContent(ctx context.Context, filePath string, timeout time.Duration) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("timeout waiting for file: %s", filePath)
+		case <-ticker.C:
+			if _, err := os.Stat(filePath); err == nil {
+				// File exists, read it
+				content, err := os.ReadFile(filePath)
+				if err != nil {
+					return "", fmt.Errorf("failed to read file %s: %w", filePath, err)
+				}
+
+				// Trim whitespace and return
+				result := strings.TrimSpace(string(content))
+				if result == "" {
+					log.Printf("File %s is empty, waiting for content...", filePath)
+					continue
+				}
+
+				return result, nil
+			}
+		}
+	}
+}
+
+// getEnvOrDefault gets environment variable or returns default value
+func getEnvOrDefault(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+// Helper functions
+
 func createProgressBar(percentage float64) string {
 	barLength := 20
 	filledLength := int(percentage / 100 * float64(barLength))
@@ -372,15 +596,6 @@ func createProgressBar(percentage float64) string {
 	return fmt.Sprintf("[%s]", bar)
 }
 
-// updateStatusMessage updates the progress message
-func updateStatusMessage(bot *tgbotapi.BotAPI, chatID int64, messageID int, text string) {
-	editMsg := tgbotapi.NewEditMessageText(chatID, messageID, text)
-	if _, err := bot.Send(editMsg); err != nil {
-		log.Printf("Error updating status message: %v", err)
-	}
-}
-
-// formatBytes formats bytes into human readable format
 func formatBytes(bytes int64) string {
 	const unit = 1024
 	if bytes < unit {
@@ -394,7 +609,6 @@ func formatBytes(bytes int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
-// formatDuration formats a duration into human readable format
 func formatDuration(d time.Duration) string {
 	if d < time.Minute {
 		return fmt.Sprintf("%.0fs", d.Seconds())
@@ -404,43 +618,27 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%.0fh %.0fm", d.Hours(), d.Minutes()-60*float64(int(d.Hours())))
 }
 
-// downloadFile downloads a file from Telegram servers (legacy function - kept for compatibility)
-func downloadFile(bot *tgbotapi.BotAPI, fileID, fileName, downloadFolder string, fileSize int64) error {
-	return downloadFileWithProgress(bot, fileID, fileName, downloadFolder, fileSize, 0, 0)
-}
-
-// isAllowedFileType checks if a filename has an allowed extension
 func isAllowedFileType(filename string, allowedExtensions []string) bool {
 	if len(allowedExtensions) == 0 {
-		return true // No restrictions
+		return true
 	}
 
 	ext := strings.ToLower(filepath.Ext(filename))
 	if ext != "" && strings.HasPrefix(ext, ".") {
-		ext = ext[1:] // Remove the dot
+		ext = ext[1:]
 	}
 
-	for _, allowedExt := range allowedExtensions {
-		if ext == allowedExt {
-			return true
-		}
-	}
-
-	return false
+	return slices.Contains(allowedExtensions, ext)
 }
 
-// sanitizeFilename removes or replaces invalid characters in filename
 func sanitizeFilename(filename string) string {
-	// Replace invalid characters with underscores
 	invalidChars := []string{"/", "\\", ":", "*", "?", "\"", "<", ">", "|"}
 	for _, char := range invalidChars {
 		filename = strings.ReplaceAll(filename, char, "_")
 	}
 
-	// Remove leading/trailing spaces and dots
 	filename = strings.Trim(filename, " .")
 
-	// Ensure filename is not empty
 	if filename == "" {
 		filename = "unnamed_file"
 	}
@@ -448,7 +646,6 @@ func sanitizeFilename(filename string) string {
 	return filename
 }
 
-// getUniqueFilePath ensures the file path is unique by adding a number suffix if needed
 func getUniqueFilePath(filePath string) string {
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {
 		return filePath
