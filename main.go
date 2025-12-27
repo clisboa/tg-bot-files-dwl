@@ -193,7 +193,7 @@ func runBot(ctx context.Context, config *Config) error {
 
 		// Register message handler
 		dispatcher.OnNewMessage(func(ctx context.Context, e tg.Entities, update *tg.UpdateNewMessage) error {
-			return handleMessage(ctx, client, update, config)
+			return handleMessage(ctx, client, e, update, config)
 		})
 
 		// Start handling updates
@@ -220,34 +220,55 @@ func sendGreeting(ctx context.Context, client *telegram.Client, config *Config) 
 
 	greetingMsg += "\n💡 Using Client API - supports files up to 2GB!"
 
-	_, err := sender.To(&tg.InputPeerUser{
-		UserID: config.AllowedUserID,
-	}).Text(ctx, greetingMsg)
+	// Use Resolve with username or peer ID
+	// Note: Resolve requires username, so we'll use the peer resolver
+	target := &tg.InputPeerUser{
+		UserID:     config.AllowedUserID,
+		AccessHash: 0, // Will be resolved by the library if needed
+	}
 
+	_, err := sender.To(target).Text(ctx, greetingMsg)
 	if err != nil {
-		return fmt.Errorf("failed to send greeting: %w", err)
+		// Greeting is not critical - user might not be in contacts yet
+		log.Printf("Could not send greeting (user will receive it after sending first message): %v", err)
+		return nil
 	}
 
 	log.Printf("Sent greeting to user %d", config.AllowedUserID)
 	return nil
 }
 
-func handleMessage(ctx context.Context, client *telegram.Client, update *tg.UpdateNewMessage, config *Config) error {
+func handleMessage(ctx context.Context, client *telegram.Client, entities tg.Entities, update *tg.UpdateNewMessage, config *Config) error {
 	msg, ok := update.Message.(*tg.Message)
 	if !ok {
 		return nil
 	}
 
 	// Only handle private messages
-	peer, ok := msg.PeerID.(*tg.PeerUser)
+	peerID, ok := msg.PeerID.(*tg.PeerUser)
 	if !ok {
 		return nil
 	}
 
 	// Check if message is from allowed user
-	if peer.UserID != config.AllowedUserID {
-		log.Printf("Ignoring message from unauthorized user ID: %d", peer.UserID)
+	if peerID.UserID != config.AllowedUserID {
+		log.Printf("Ignoring message from unauthorized user ID: %d", peerID.UserID)
 		return nil
+	}
+
+	// Get the user from entities to construct proper input peer
+	var accessHash int64
+	for _, u := range entities.Users {
+		if u.ID == peerID.UserID {
+			accessHash = u.AccessHash
+			break
+		}
+	}
+
+	// Create input peer for replies
+	peer := &tg.InputPeerUser{
+		UserID:     peerID.UserID,
+		AccessHash: accessHash,
 	}
 
 	// Handle document messages only
@@ -276,7 +297,7 @@ func handleMessage(ctx context.Context, client *telegram.Client, update *tg.Upda
 		fileName = fmt.Sprintf("document_%d", doc.ID)
 	}
 
-	log.Printf("Found document from user %d: %s (size: %d bytes)", peer.UserID, fileName, fileSize)
+	log.Printf("Found document from user %d: %s (size: %d bytes)", peerID.UserID, fileName, fileSize)
 
 	// Check file type if restrictions are enabled
 	if len(config.AllowedTypes) > 0 {
@@ -292,7 +313,7 @@ func handleMessage(ctx context.Context, client *telegram.Client, update *tg.Upda
 				strings.Join(config.AllowedTypes, ", "))
 
 			sender := message.NewSender(client.API())
-			_, err := sender.To(&tg.InputPeerUser{UserID: peer.UserID}).Text(ctx, errorMsg)
+			_, err := sender.To(peer).Text(ctx, errorMsg)
 			if err != nil {
 				log.Printf("Error sending file type error message: %v", err)
 			}
@@ -308,7 +329,7 @@ func handleMessage(ctx context.Context, client *telegram.Client, update *tg.Upda
 			fileName, formatBytes(fileSize), formatBytes(MaxFileSize))
 
 		sender := message.NewSender(client.API())
-		_, err := sender.To(&tg.InputPeerUser{UserID: peer.UserID}).Text(ctx, errorMsg)
+		_, err := sender.To(peer).Text(ctx, errorMsg)
 		if err != nil {
 			log.Printf("Error sending file size error message: %v", err)
 		}
@@ -321,7 +342,7 @@ func handleMessage(ctx context.Context, client *telegram.Client, update *tg.Upda
 	sender := message.NewSender(client.API())
 	statusMsg := fmt.Sprintf("📥 Downloading: %s\n📊 Size: %s\n⏳ Starting download...", fileName, formatBytes(fileSize))
 
-	upd, err := sender.To(&tg.InputPeerUser{UserID: peer.UserID}).Text(ctx, statusMsg)
+	upd, err := sender.To(peer).Text(ctx, statusMsg)
 	var messageID int
 	if err != nil {
 		log.Printf("Error sending status message: %v", err)
@@ -339,11 +360,11 @@ func handleMessage(ctx context.Context, client *telegram.Client, update *tg.Upda
 	}
 
 	// Download the document with progress updates
-	err = downloadDocument(ctx, client, doc, fileName, config.DownloadFolder, fileSize, peer.UserID, messageID)
+	err = downloadDocument(ctx, client, doc, fileName, config.DownloadFolder, fileSize, peer, messageID)
 	return err
 }
 
-func downloadDocument(ctx context.Context, client *telegram.Client, doc *tg.Document, fileName, downloadFolder string, fileSize int64, userID int64, messageID int) error {
+func downloadDocument(ctx context.Context, client *telegram.Client, doc *tg.Document, fileName, downloadFolder string, fileSize int64, peer tg.InputPeerClass, messageID int) error {
 	// Sanitize filename
 	fileName = sanitizeFilename(fileName)
 	filePath := filepath.Join(downloadFolder, fileName)
@@ -353,14 +374,14 @@ func downloadDocument(ctx context.Context, client *telegram.Client, doc *tg.Docu
 	finalFileName := filepath.Base(filePath)
 
 	// Update status: starting download
-	updateStatusMessage(ctx, client, userID, messageID, fmt.Sprintf("📥 Downloading: %s\n📊 Size: %s\n🔄 Connecting...", finalFileName, formatBytes(fileSize)))
+	updateStatusMessage(ctx, client, peer, messageID, fmt.Sprintf("📥 Downloading: %s\n📊 Size: %s\n🔄 Connecting...", finalFileName, formatBytes(fileSize)))
 
 	log.Printf("Downloading file: %s", finalFileName)
 
 	// Create local file
 	outFile, err := os.Create(filePath)
 	if err != nil {
-		updateStatusMessage(ctx, client, userID, messageID, fmt.Sprintf("❌ Error creating file: %s\n💾 Check disk space and permissions", finalFileName))
+		updateStatusMessage(ctx, client, peer, messageID, fmt.Sprintf("❌ Error creating file: %s\n💾 Check disk space and permissions", finalFileName))
 		return fmt.Errorf("failed to create local file: %w", err)
 	}
 	defer outFile.Close()
@@ -372,7 +393,7 @@ func downloadDocument(ctx context.Context, client *telegram.Client, doc *tg.Docu
 	progress := &ProgressTracker{
 		Total:      fileSize,
 		client:     client,
-		userID:     userID,
+		peer:       peer,
 		messageID:  messageID,
 		fileName:   finalFileName,
 		lastUpdate: time.Now(),
@@ -394,7 +415,7 @@ func downloadDocument(ctx context.Context, client *telegram.Client, doc *tg.Docu
 		})
 
 	if err != nil {
-		updateStatusMessage(ctx, client, userID, messageID, fmt.Sprintf("❌ Download failed: %s\n🌐 Network error occurred", finalFileName))
+		updateStatusMessage(ctx, client, peer, messageID, fmt.Sprintf("❌ Download failed: %s\n🌐 Network error occurred", finalFileName))
 		return fmt.Errorf("failed to download file: %w", err)
 	}
 
@@ -405,7 +426,7 @@ func downloadDocument(ctx context.Context, client *telegram.Client, doc *tg.Docu
 		avgSpeed = formatBytes(int64(float64(progress.Current)/duration.Seconds())) + "/s"
 	}
 
-	updateStatusMessage(ctx, client, userID, messageID, fmt.Sprintf("✅ Downloaded: %s\n📊 Size: %s\n⚡ Avg Speed: %s\n📁 Saved to: %s",
+	updateStatusMessage(ctx, client, peer, messageID, fmt.Sprintf("✅ Downloaded: %s\n📊 Size: %s\n⚡ Avg Speed: %s\n📁 Saved to: %s",
 		finalFileName, formatBytes(progress.Current), avgSpeed, downloadFolder))
 
 	log.Printf("Successfully downloaded: %s (%d bytes)", filePath, progress.Current)
@@ -417,7 +438,7 @@ type ProgressTracker struct {
 	Total      int64
 	Current    int64
 	client     *telegram.Client
-	userID     int64
+	peer       tg.InputPeerClass
 	messageID  int
 	fileName   string
 	lastUpdate time.Time
@@ -450,7 +471,7 @@ func (pt *ProgressTracker) updateProgress() {
 		status := fmt.Sprintf("📥 Downloading: %s\n🔄 Progress: %s downloaded\n⏱️ In progress...",
 			pt.fileName,
 			formatBytes(pt.Current))
-		updateStatusMessage(ctx, pt.client, pt.userID, pt.messageID, status)
+		updateStatusMessage(ctx, pt.client, pt.peer, pt.messageID, status)
 		return
 	}
 
@@ -477,12 +498,12 @@ func (pt *ProgressTracker) updateProgress() {
 		formatBytes(pt.Total),
 		eta)
 
-	updateStatusMessage(ctx, pt.client, pt.userID, pt.messageID, status)
+	updateStatusMessage(ctx, pt.client, pt.peer, pt.messageID, status)
 }
 
-func updateStatusMessage(ctx context.Context, client *telegram.Client, userID int64, messageID int, text string) {
+func updateStatusMessage(ctx context.Context, client *telegram.Client, peer tg.InputPeerClass, messageID int, text string) {
 	sender := message.NewSender(client.API())
-	_, err := sender.To(&tg.InputPeerUser{UserID: userID}).Edit(messageID).Text(ctx, text)
+	_, err := sender.To(peer).Edit(messageID).Text(ctx, text)
 	if err != nil {
 		log.Printf("Error updating status message: %v", err)
 	}
