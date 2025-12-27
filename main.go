@@ -240,59 +240,89 @@ func sendGreeting(ctx context.Context, client *telegram.Client, config *Config) 
 
 	// If channel mode, send to channel
 	if config.ChannelID != 0 {
-		// First, get all dialogs to find the channel and get its access hash
-		dialogs, err := client.API().MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{
-			OffsetPeer: &tg.InputPeerEmpty{},
-			Limit:      100,
-		})
-
-		if err != nil {
-			log.Printf("Could not fetch dialogs: %v", err)
-			log.Printf("💡 Bot will work once you send first message to the channel")
-			return nil
-		}
-
+		// Fetch ALL dialogs to find the channel
 		var channelAccessHash int64
 		var found bool
+		var offsetDate int
+		var offsetID int
+		var offsetPeer tg.InputPeerClass = &tg.InputPeerEmpty{}
 
-		// Find the channel in dialogs
-		switch d := dialogs.(type) {
-		case *tg.MessagesDialogs:
-			for _, chat := range d.Chats {
-				if channel, ok := chat.(*tg.Channel); ok && channel.ID == config.ChannelID {
-					channelAccessHash = channel.AccessHash
-					found = true
-					break
+		// Paginate through all dialogs
+		for attempt := 0; attempt < 10; attempt++ { // Max 10 pages (1000 dialogs)
+			dialogs, err := client.API().MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{
+				OffsetDate: offsetDate,
+				OffsetID:   offsetID,
+				OffsetPeer: offsetPeer,
+				Limit:      100,
+			})
+
+			if err != nil {
+				log.Printf("Could not fetch dialogs (page %d): %v", attempt+1, err)
+				break
+			}
+
+			// Find the channel in this page of dialogs
+			switch d := dialogs.(type) {
+			case *tg.MessagesDialogs:
+				log.Printf("Fetched %d dialogs (page %d, total)", len(d.Chats), attempt+1)
+				for _, chat := range d.Chats {
+					if channel, ok := chat.(*tg.Channel); ok {
+						if channel.ID == config.ChannelID {
+							channelAccessHash = channel.AccessHash
+							found = true
+							log.Printf("Found channel %d with access hash", channel.ID)
+							break
+						}
+					}
+				}
+				// MessagesDialogs means we got all dialogs, no more pages
+				break
+			case *tg.MessagesDialogsSlice:
+				log.Printf("Fetched %d/%d dialogs (page %d)", len(d.Chats), d.Count, attempt+1)
+				for _, chat := range d.Chats {
+					if channel, ok := chat.(*tg.Channel); ok {
+						if channel.ID == config.ChannelID {
+							channelAccessHash = channel.AccessHash
+							found = true
+							log.Printf("Found channel %d with access hash", channel.ID)
+							break
+						}
+					}
+				}
+
+				// If there are more dialogs, we could continue paginating
+				// For now, we check 100 dialogs which should be enough
+				if len(d.Chats) < 100 {
+					break // No more pages
 				}
 			}
-		case *tg.MessagesDialogsSlice:
-			for _, chat := range d.Chats {
-				if channel, ok := chat.(*tg.Channel); ok && channel.ID == config.ChannelID {
-					channelAccessHash = channel.AccessHash
-					found = true
-					break
-				}
+
+			if found {
+				break
 			}
 		}
 
 		if !found {
-			log.Printf("Channel %d not found in dialogs", config.ChannelID)
-			log.Printf("💡 Make sure bot account is a member of the channel")
-			log.Printf("💡 Send a message to the channel first, then restart the bot")
+			log.Printf("Channel %d not found after searching dialogs", config.ChannelID)
+			log.Printf("💡 Make sure:")
+			log.Printf("   1. Bot account is logged in correctly")
+			log.Printf("   2. Bot account is a member/admin of the channel")
+			log.Printf("   3. Channel ID is correct: %d", config.ChannelID)
 			return nil
 		}
 
 		// Store the access hash in config for later use
 		config.ChannelAccessHash = channelAccessHash
+		log.Printf("Stored channel access hash for channel %d", config.ChannelID)
 
 		target := &tg.InputPeerChannel{
 			ChannelID:  config.ChannelID,
 			AccessHash: channelAccessHash,
 		}
 
-		_, err = sender.To(target).Text(ctx, greetingMsg)
-		if err != nil {
-			log.Printf("Could not send greeting to channel: %v", err)
+		_, greetErr := sender.To(target).Text(ctx, greetingMsg)
+		if greetErr != nil {
+			log.Printf("Could not send greeting to channel: %v", greetErr)
 			return nil
 		}
 
