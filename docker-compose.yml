@@ -1,0 +1,29 @@
+version: "3.8"
+
+services:
+  tg-bot:
+    build: .
+    container_name: tg-bot-files-dwl
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID}
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
+      - TELEGRAM_PHONE=${TELEGRAM_PHONE}
+      - TELEGRAM_FOLDER=/downloads
+      - TELEGRAM_USER_ID=${TELEGRAM_USER_ID}
+      - TELEGRAM_DEBUG=${TELEGRAM_DEBUG:-false}
+      - TELEGRAM_ALLOWED_TYPES=${TELEGRAM_ALLOWED_TYPES:-}
+      - TELEGRAM_CODE_FILE=/auth/telegram_code.txt
+      - TELEGRAM_PASSWORD_FILE=/auth/telegram_password.txt
+    volumes:
+      # Mount downloads folder
+      - ./downloads:/downloads
+      # Mount session file for persistence
+      - ./session.json:/session.json
+      # Mount auth folder for code/password files
+      - ./auth:/auth
+    # Note: For initial authentication:
+    # 1. Start: docker-compose up -d
+    # 2. Watch logs: docker-compose logs -f
+    # 3. When prompted, create: echo "12345" > auth/telegram_code.txt
+    # 4. Bot will auto-authenticate and delete the file
