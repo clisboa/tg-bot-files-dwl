@@ -207,6 +207,37 @@ func runBot(ctx context.Context, config *Config) error {
 }
 
 func sendGreeting(ctx context.Context, client *telegram.Client, config *Config) error {
+	// Try to get user info from contacts first
+	contacts, err := client.API().ContactsGetContacts(ctx, 0)
+	if err != nil {
+		log.Printf("Greeting skipped: could not fetch contacts (%v)", err)
+		log.Printf("💡 To receive greeting on bot start:")
+		log.Printf("   1. Add user %d to bot account's contacts, OR", config.AllowedUserID)
+		log.Printf("   2. Send any message from user to bot first")
+		return nil
+	}
+
+	var accessHash int64
+	var found bool
+
+	if savedContacts, ok := contacts.(*tg.ContactsContacts); ok {
+		for _, userClass := range savedContacts.Users {
+			if user, ok := userClass.(*tg.User); ok && user.ID == config.AllowedUserID {
+				accessHash = user.AccessHash
+				found = true
+				break
+			}
+		}
+	}
+
+	if !found {
+		log.Printf("Greeting skipped: user %d not in contacts", config.AllowedUserID)
+		log.Printf("💡 To receive greeting on bot start:")
+		log.Printf("   1. Add user %d to bot account's contacts, OR", config.AllowedUserID)
+		log.Printf("   2. Send any message from user to bot first")
+		return nil
+	}
+
 	sender := message.NewSender(client.API())
 
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
@@ -220,21 +251,18 @@ func sendGreeting(ctx context.Context, client *telegram.Client, config *Config) 
 
 	greetingMsg += "\n💡 Using Client API - supports files up to 2GB!"
 
-	// Use Resolve with username or peer ID
-	// Note: Resolve requires username, so we'll use the peer resolver
 	target := &tg.InputPeerUser{
 		UserID:     config.AllowedUserID,
-		AccessHash: 0, // Will be resolved by the library if needed
+		AccessHash: accessHash,
 	}
 
-	_, err := sender.To(target).Text(ctx, greetingMsg)
+	_, err = sender.To(target).Text(ctx, greetingMsg)
 	if err != nil {
-		// Greeting is not critical - user might not be in contacts yet
-		log.Printf("Could not send greeting (user will receive it after sending first message): %v", err)
+		log.Printf("Could not send greeting: %v", err)
 		return nil
 	}
 
-	log.Printf("Sent greeting to user %d", config.AllowedUserID)
+	log.Printf("✅ Sent greeting to user %d", config.AllowedUserID)
 	return nil
 }
 
