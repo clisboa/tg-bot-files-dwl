@@ -248,7 +248,7 @@ func sendGreeting(ctx context.Context, client *telegram.Client, config *Config) 
 		var offsetPeer tg.InputPeerClass = &tg.InputPeerEmpty{}
 
 		// Paginate through all dialogs
-		for attempt := 0; attempt < 10; attempt++ { // Max 10 pages (1000 dialogs)
+		for attempt := range 10 { // Max 10 pages (1000 dialogs)
 			dialogs, err := client.API().MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{
 				OffsetDate: offsetDate,
 				OffsetID:   offsetID,
@@ -276,7 +276,7 @@ func sendGreeting(ctx context.Context, client *telegram.Client, config *Config) 
 					}
 				}
 				// MessagesDialogs means we got all dialogs, no more pages
-				break
+
 			case *tg.MessagesDialogsSlice:
 				log.Printf("Fetched %d/%d dialogs (page %d)", len(d.Chats), d.Count, attempt+1)
 				for _, chat := range d.Chats {
