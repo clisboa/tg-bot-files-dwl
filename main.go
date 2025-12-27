@@ -34,6 +34,7 @@ type Config struct {
 	APIHash        string
 	Phone          string
 	DownloadFolder string
+	ChannelID      int64
 	AllowedUserID  int64
 	Debug          bool
 	AllowedTypes   []string
@@ -49,6 +50,7 @@ func main() {
 		apiHash      = flag.String("api-hash", os.Getenv("TELEGRAM_API_HASH"), "Telegram API Hash from https://my.telegram.org")
 		phone        = flag.String("phone", os.Getenv("TELEGRAM_PHONE"), "Phone number (with country code, e.g., +1234567890)")
 		folder       = flag.String("folder", os.Getenv("TELEGRAM_FOLDER"), "Download folder path")
+		channelID    = flag.String("channel", os.Getenv("TELEGRAM_CHANNEL_ID"), "Channel/Group ID where bot monitors (optional, use instead of private chat)")
 		allowedUID   = flag.String("user", os.Getenv("TELEGRAM_USER_ID"), "Allowed user ID (required)")
 		debug        = flag.String("debug", os.Getenv("TELEGRAM_DEBUG"), "Debug mode? (optional - true or false/leave empty for off)")
 		allowedTypes = flag.String("types", os.Getenv("TELEGRAM_ALLOWED_TYPES"), "Comma-separated list of allowed file extensions (e.g., pdf,txt,docx). Leave empty to allow all types")
@@ -118,11 +120,21 @@ func main() {
 		log.Fatalf("Invalid user ID format: %v", err)
 	}
 
+	// Parse channel ID if provided
+	var parsedChannelID int64
+	if *channelID != "" {
+		parsedChannelID, err = strconv.ParseInt(*channelID, 10, 64)
+		if err != nil {
+			log.Fatalf("Invalid channel ID format: %v", err)
+		}
+	}
+
 	config := &Config{
 		APIID:          *apiID,
 		APIHash:        *apiHash,
 		Phone:          *phone,
 		DownloadFolder: *folder,
+		ChannelID:      parsedChannelID,
 		AllowedUserID:  allowedUserID,
 		Debug:          debugMode,
 		AllowedTypes:   allowedExtensions,
@@ -132,6 +144,11 @@ func main() {
 	}
 
 	log.Printf("Download folder: %s", config.DownloadFolder)
+	if config.ChannelID != 0 {
+		log.Printf("Monitoring channel/group ID: %d", config.ChannelID)
+	} else {
+		log.Printf("Monitoring private messages")
+	}
 	log.Printf("Allowed user ID: %d", config.AllowedUserID)
 	log.Printf("Session file: %s", config.SessionFile)
 	log.Printf("File size limit: %s (Client API)", formatBytes(MaxFileSize))
@@ -207,11 +224,44 @@ func runBot(ctx context.Context, config *Config) error {
 }
 
 func sendGreeting(ctx context.Context, client *telegram.Client, config *Config) error {
-	// Try to get user info from contacts first
+	sender := message.NewSender(client.API())
+
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+	greetingMsg := fmt.Sprintf("[%s] Hi, show me the docs!\n\n📋 File size limit: %s", timestamp, formatBytes(MaxFileSize))
+
+	if len(config.AllowedTypes) > 0 {
+		greetingMsg += fmt.Sprintf("\n📎 Allowed types: %s", strings.Join(config.AllowedTypes, ", "))
+	} else {
+		greetingMsg += "\n📎 All file types accepted"
+	}
+
+	greetingMsg += "\n💡 Using Client API - supports files up to 2GB!"
+
+	// If channel mode, send to channel
+	if config.ChannelID != 0 {
+		target := &tg.InputPeerChannel{
+			ChannelID:  config.ChannelID,
+			AccessHash: 0, // Will be resolved
+		}
+
+		_, err := sender.To(target).Text(ctx, greetingMsg)
+		if err != nil {
+			log.Printf("Could not send greeting to channel: %v", err)
+			log.Printf("💡 Make sure:")
+			log.Printf("   1. Bot account is a member of the channel/group")
+			log.Printf("   2. Channel ID is correct (use negative ID for supergroups)")
+			return nil
+		}
+
+		log.Printf("✅ Sent greeting to channel %d", config.ChannelID)
+		return nil
+	}
+
+	// For private messages, try to get user from contacts
 	contacts, err := client.API().ContactsGetContacts(ctx, 0)
 	if err != nil {
-		log.Printf("Greeting skipped: could not fetch contacts (%v)", err)
-		log.Printf("💡 To receive greeting on bot start:")
+		log.Printf("Greeting skipped: could not fetch contacts")
+		log.Printf("💡 Use channel mode (-channel flag) for reliable greeting, or:")
 		log.Printf("   1. Add user %d to bot account's contacts, OR", config.AllowedUserID)
 		log.Printf("   2. Send any message from user to bot first")
 		return nil
@@ -232,24 +282,11 @@ func sendGreeting(ctx context.Context, client *telegram.Client, config *Config) 
 
 	if !found {
 		log.Printf("Greeting skipped: user %d not in contacts", config.AllowedUserID)
-		log.Printf("💡 To receive greeting on bot start:")
+		log.Printf("💡 Use channel mode (-channel flag) for reliable greeting, or:")
 		log.Printf("   1. Add user %d to bot account's contacts, OR", config.AllowedUserID)
 		log.Printf("   2. Send any message from user to bot first")
 		return nil
 	}
-
-	sender := message.NewSender(client.API())
-
-	timestamp := time.Now().Format("2006-01-02 15:04:05")
-	greetingMsg := fmt.Sprintf("[%s] Hi, show me the docs!\n\n📋 File size limit: %s", timestamp, formatBytes(MaxFileSize))
-
-	if len(config.AllowedTypes) > 0 {
-		greetingMsg += fmt.Sprintf("\n📎 Allowed types: %s", strings.Join(config.AllowedTypes, ", "))
-	} else {
-		greetingMsg += "\n📎 All file types accepted"
-	}
-
-	greetingMsg += "\n💡 Using Client API - supports files up to 2GB!"
 
 	target := &tg.InputPeerUser{
 		UserID:     config.AllowedUserID,
@@ -272,31 +309,63 @@ func handleMessage(ctx context.Context, client *telegram.Client, entities tg.Ent
 		return nil
 	}
 
-	// Only handle private messages
-	peerID, ok := msg.PeerID.(*tg.PeerUser)
-	if !ok {
-		return nil
-	}
+	// Determine the peer and reply target
+	var peer tg.InputPeerClass
+	var senderUserID int64
 
-	// Check if message is from allowed user
-	if peerID.UserID != config.AllowedUserID {
-		log.Printf("Ignoring message from unauthorized user ID: %d", peerID.UserID)
-		return nil
-	}
+	// Handle channel/group messages
+	if config.ChannelID != 0 {
+		// Check if message is from the configured channel
+		switch p := msg.PeerID.(type) {
+		case *tg.PeerChannel:
+			if p.ChannelID != config.ChannelID {
+				return nil // Not from our channel
+			}
 
-	// Get the user from entities to construct proper input peer
-	var accessHash int64
-	for _, u := range entities.Users {
-		if u.ID == peerID.UserID {
-			accessHash = u.AccessHash
-			break
+			// For channels, we can use the channel ID from config
+			// The access hash will be resolved by the sender
+			peer = &tg.InputPeerChannel{
+				ChannelID:  p.ChannelID,
+				AccessHash: 0, // Will be resolved by library
+			}
+
+			// Get sender user ID from message
+			if msg.FromID != nil {
+				if fromUser, ok := msg.FromID.(*tg.PeerUser); ok {
+					senderUserID = fromUser.UserID
+				}
+			}
+		default:
+			return nil // Not a channel message
+		}
+	} else {
+		// Handle private messages
+		peerUser, ok := msg.PeerID.(*tg.PeerUser)
+		if !ok {
+			return nil
+		}
+
+		senderUserID = peerUser.UserID
+
+		// Get the user from entities to construct proper input peer
+		var accessHash int64
+		for _, u := range entities.Users {
+			if u.ID == peerUser.UserID {
+				accessHash = u.AccessHash
+				break
+			}
+		}
+
+		peer = &tg.InputPeerUser{
+			UserID:     peerUser.UserID,
+			AccessHash: accessHash,
 		}
 	}
 
-	// Create input peer for replies
-	peer := &tg.InputPeerUser{
-		UserID:     peerID.UserID,
-		AccessHash: accessHash,
+	// Check if message is from allowed user
+	if senderUserID != config.AllowedUserID {
+		log.Printf("Ignoring message from unauthorized user ID: %d", senderUserID)
+		return nil
 	}
 
 	// Handle document messages only
@@ -325,7 +394,7 @@ func handleMessage(ctx context.Context, client *telegram.Client, entities tg.Ent
 		fileName = fmt.Sprintf("document_%d", doc.ID)
 	}
 
-	log.Printf("Found document from user %d: %s (size: %d bytes)", peerID.UserID, fileName, fileSize)
+	log.Printf("Found document from user %d: %s (size: %d bytes)", senderUserID, fileName, fileSize)
 
 	// Check file type if restrictions are enabled
 	if len(config.AllowedTypes) > 0 {
